@@ -4,6 +4,51 @@ import { useEffect, useRef, useState } from "react";
 import ProgressOverlay from "@/components/ProgressOverlay";
 import Results, { DocItem } from "@/components/Results";
 
+/* ============================================================
+   ASYNC DESIGN
+   1. Make a jobId, send form+jobId to the /api/generate proxy.
+   2. Proxy forwards to n8n; n8n replies instantly and runs the
+      pipeline in the background, uploading 3 files to Supabase
+      named: <jobId>-report.pdf, -deck.pptx, -action.pdf
+   3. Website polls Supabase directly for those 3 files until they exist.
+   4. Show download cards. Never holds a long connection -> never times out.
+   ============================================================ */
+
+// --- Supabase public bucket base (your project) ---
+const SUPABASE_PUBLIC =
+  "https://qglyxiqaprjnrylmavkn.supabase.co/storage/v1/object/public/reports";
+
+// the 3 files each job produces, in order
+const FILE_PLAN: {
+  kind: "pdf" | "pptx";
+  title: string;
+  subtitle: string;
+  suffix: string;
+  ext: string;
+}[] = [
+  {
+    kind: "pdf",
+    title: "Market Research Report",
+    subtitle: "The full written study",
+    suffix: "report",
+    ext: "pdf",
+  },
+  {
+    kind: "pptx",
+    title: "Presentation Deck",
+    subtitle: "Slide-ready summary",
+    suffix: "deck",
+    ext: "pptx",
+  },
+  {
+    kind: "pdf",
+    title: "Action Plan",
+    subtitle: "Company-specific recommendations",
+    suffix: "action",
+    ext: "pdf",
+  },
+];
+
 type FormState = {
   topic: string;
   docInfo: string;
@@ -42,8 +87,8 @@ export default function Home() {
   const [docs, setDocs] = useState<DocItem[] | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
+  const pollRef = useRef<number | null>(null);
 
-  // ---- connection settings (browser-saved webhook URL) ----
   const [webhookUrl, setWebhookUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [draftUrl, setDraftUrl] = useState("");
@@ -52,6 +97,9 @@ export default function Home() {
     const saved =
       typeof window !== "undefined" ? localStorage.getItem(LS_KEY) : "";
     if (saved) setWebhookUrl(saved);
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+    };
   }, []);
 
   function openSettings() {
@@ -87,6 +135,27 @@ export default function Home() {
     return Object.keys(e).length === 0;
   }
 
+  // check if a single file exists.
+  // Uses a ranged GET (bytes=0-0) instead of HEAD: public Supabase objects
+  // reliably answer a tiny ranged GET (200/206), whereas HEAD can be blocked
+  // or answered inconsistently depending on storage/CORS config.
+  async function fileExists(url: string): Promise<boolean> {
+    try {
+      const r = await fetch(url, {
+        method: "GET",
+        headers: { Range: "bytes=0-0" },
+        cache: "no-store",
+      });
+      return r.ok || r.status === 206;
+    } catch {
+      return false;
+    }
+  }
+
+  function urlFor(jobId: string, suffix: string, ext: string) {
+    return `${SUPABASE_PUBLIC}/${jobId}-${suffix}.${ext}`;
+  }
+
   async function handleSubmit(ev: React.FormEvent) {
     ev.preventDefault();
     setFatal(null);
@@ -103,47 +172,86 @@ export default function Home() {
       return;
     }
 
+    // make a unique job id
+    const jobId = `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+
     setRunning(true);
     setDone(false);
     setDocs(null);
 
+    // 1) kick off the pipeline via our proxy (avoids CORS; n8n replies instantly)
+    //    The proxy reads webhookUrl and forwards `body` to n8n.
     try {
-      const res = await fetch(webhookUrl, {
+      const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          webhookUrl,
+          body: { ...form, jobId },
+        }),
       });
-
+      // we don't rely on the body; a 200 means it started
       if (!res.ok) {
-        const text = await res.text().catch(() => "");
+        const t = await res.text().catch(() => "");
         throw new Error(
-          text
-            ? `n8n responded ${res.status}: ${text.slice(0, 300)}`
+          t
+            ? `n8n responded ${res.status}: ${t.slice(0, 200)}`
             : `n8n responded ${res.status}`,
         );
       }
-
-      const data = await res.json();
-      const items: DocItem[] = normalizeDocs(data);
-
-      if (!items.length) {
-        throw new Error(
-          "The pipeline finished but returned no documents. Check the 'Respond to Webhook' node is sending the documents array.",
-        );
-      }
-
-      setDocs(items);
-      setDone(true);
     } catch (err: any) {
       setRunning(false);
-      setDone(false);
       const msg = String(err?.message || err);
       setFatal(
         /Failed to fetch|NetworkError|load failed/i.test(msg)
-          ? "Couldn't reach n8n. Check the webhook URL in Connection settings, and that your n8n is running."
+          ? "Couldn't reach n8n to start the job. Check the webhook URL and that n8n + the tunnel are running."
           : msg,
       );
+      return;
     }
+
+    // 2) poll Supabase for the 3 files
+    const started = Date.now();
+    const MAX_MS = 20 * 60 * 1000; // give up after 20 min (pipeline is ~8-10)
+
+    if (pollRef.current) window.clearInterval(pollRef.current);
+    pollRef.current = window.setInterval(async () => {
+      // stop if user closed
+      if (Date.now() - started > MAX_MS) {
+        if (pollRef.current) window.clearInterval(pollRef.current);
+        setRunning(false);
+        setFatal(
+          "Timed out waiting for the files. The pipeline may still be running — try again shortly.",
+        );
+        return;
+      }
+
+      const urls = FILE_PLAN.map((f) => urlFor(jobId, f.suffix, f.ext));
+      const checks = await Promise.all(urls.map((u) => fileExists(u)));
+      const allReady = checks.every(Boolean);
+
+      if (allReady) {
+        if (pollRef.current) window.clearInterval(pollRef.current);
+        const items: DocItem[] = FILE_PLAN.map((f, i) => ({
+          kind: f.kind,
+          title: f.title,
+          subtitle: f.subtitle,
+          url: urls[i],
+          filename: `${
+            form.topic
+              ? form.topic
+                  .replace(/[^\w\s-]/g, "")
+                  .trim()
+                  .replace(/\s+/g, "-")
+                  .slice(0, 50)
+              : "report"
+          }-${f.suffix}.${f.ext}`,
+        }));
+        setDocs(items);
+        setDone(true);
+        setRunning(false); // stop the "Running…" state so results can show
+      }
+    }, 5000); // check every 5s
   }
 
   function closeOverlay() {
@@ -160,14 +268,16 @@ export default function Home() {
   }
 
   function reset() {
+    if (pollRef.current) window.clearInterval(pollRef.current);
     setDocs(null);
+    setDone(false);
     setForm(INITIAL);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   return (
     <>
-      {/* ---------- MASTHEAD ---------- */}
+      {/* MASTHEAD */}
       <header className="masthead">
         <div className="mark">
           <svg
@@ -217,7 +327,7 @@ export default function Home() {
         </button>
       </header>
 
-      {/* ---------- HERO ---------- */}
+      {/* HERO */}
       <section className="hero">
         <div className="hero-lede">
           <span className="eyebrow">Brief → Package · One pass</span>
@@ -241,7 +351,7 @@ export default function Home() {
             <div>
               <div className="stat-label">Typical run</div>
               <div className="stat-value">
-                ~2 <span className="u">min</span>
+                ~8 <span className="u">min</span>
               </div>
             </div>
             <div>
@@ -252,7 +362,6 @@ export default function Home() {
             </div>
           </div>
         </div>
-
         <div className="hero-instrument">
           <HeroInstrument
             primary={form.colorPrimary}
@@ -261,7 +370,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ---------- FORM ---------- */}
+      {/* FORM */}
       <section className="panel-region">
         <div className="panel">
           <div className="panel-head">
@@ -281,7 +390,6 @@ export default function Home() {
           </div>
 
           <form className="form-body" onSubmit={handleSubmit} noValidate>
-            {/* GROUP 1 — Scope */}
             <fieldset className="group">
               <legend className="group-legend">
                 <span className="group-num">01</span>
@@ -303,10 +411,9 @@ export default function Home() {
                   />
                   {errors.topic && <span className="err">{errors.topic}</span>}
                 </div>
-
                 <div className="field full">
                   <label htmlFor="docInfo">
-                    Background & source material
+                    Background & source material{" "}
                     <span className="hint">
                       context the report should build on
                     </span>
@@ -321,7 +428,6 @@ export default function Home() {
               </div>
             </fieldset>
 
-            {/* GROUP 2 — Shape */}
             <fieldset className="group">
               <legend className="group-legend">
                 <span className="group-num">02</span>
@@ -331,7 +437,7 @@ export default function Home() {
               <div className="grid">
                 <div className="field">
                   <label htmlFor="rules">
-                    Rules & constraints
+                    Rules & constraints{" "}
                     <span className="hint">tone, length, do / don't</span>
                   </label>
                   <textarea
@@ -343,7 +449,7 @@ export default function Home() {
                 </div>
                 <div className="field">
                   <label htmlFor="specialSections">
-                    Special sections
+                    Special sections{" "}
                     <span className="hint">sections to include</span>
                   </label>
                   <textarea
@@ -356,7 +462,6 @@ export default function Home() {
               </div>
             </fieldset>
 
-            {/* GROUP 3 — The company */}
             <fieldset className="group">
               <legend className="group-legend">
                 <span className="group-num">03</span>
@@ -382,7 +487,7 @@ export default function Home() {
                 </div>
                 <div className="field">
                   <label htmlFor="companyIdeas">
-                    Company ideas & direction
+                    Company ideas & direction{" "}
                     <span className="hint">what they're considering</span>
                   </label>
                   <input
@@ -395,7 +500,6 @@ export default function Home() {
               </div>
             </fieldset>
 
-            {/* GROUP 4 — Frame */}
             <fieldset className="group">
               <legend className="group-legend">
                 <span className="group-num">04</span>
@@ -421,8 +525,7 @@ export default function Home() {
                 </div>
                 <div className="field">
                   <label htmlFor="geography">
-                    Geography
-                    <span className="hint">markets in scope</span>
+                    Geography <span className="hint">markets in scope</span>
                   </label>
                   <input
                     id="geography"
@@ -433,7 +536,7 @@ export default function Home() {
                 </div>
                 <div className="field full">
                   <label htmlFor="timeHorizon">
-                    Time horizon
+                    Time horizon{" "}
                     <span className="hint">
                       the window the report should reason over
                     </span>
@@ -448,7 +551,6 @@ export default function Home() {
               </div>
             </fieldset>
 
-            {/* GROUP 5 — Look */}
             <fieldset className="group">
               <legend className="group-legend">
                 <span className="group-num">05</span>
@@ -471,12 +573,11 @@ export default function Home() {
               </div>
             </fieldset>
 
-            {/* SUBMIT */}
             <div className="submit-bar">
               <p className="submit-note">
-                On submit, your brief is sent to your <b>n8n workflow</b>, which
-                returns two PDFs and a presentation deck. Keep this tab open
-                while it runs.
+                On submit, your brief starts your <b>n8n workflow</b>. The page
+                checks for your finished files and shows them here when ready —
+                you can keep waiting safely.
                 {!connected && (
                   <>
                     {" "}
@@ -515,13 +616,11 @@ export default function Home() {
           </form>
         </div>
 
-        {/* RESULTS */}
         <div ref={resultsRef}>
-          {docs && !running && !done && <Results docs={docs} onReset={reset} />}
+          {docs && !running && <Results docs={docs} onReset={reset} />}
         </div>
       </section>
 
-      {/* ---------- FOOTER ---------- */}
       <footer className="foot">
         <span>Meridian Research · Powered by your n8n pipeline</span>
         <button type="button" className="inline-link" onClick={openSettings}>
@@ -529,10 +628,8 @@ export default function Home() {
         </button>
       </footer>
 
-      {/* ---------- PROGRESS OVERLAY ---------- */}
       <ProgressOverlay active={running} done={done} onClose={closeOverlay} />
 
-      {/* ---------- CONNECTION SETTINGS MODAL ---------- */}
       {settingsOpen && (
         <div
           className="cs-root"
@@ -549,7 +646,7 @@ export default function Home() {
             <p className="cs-help">
               Paste the current n8n webhook URL. It looks like{" "}
               <code>
-                https://your-app.up.railway.app/webhook/market-research
+                https://xxxx.trycloudflare.com/webhook/market-research
               </code>
               . Saved in this browser only.
             </p>
@@ -561,7 +658,7 @@ export default function Home() {
               className="cs-input"
               value={draftUrl}
               onChange={(e) => setDraftUrl(e.target.value)}
-              placeholder="https://your-app.up.railway.app/webhook/market-research"
+              placeholder="https://xxxx.trycloudflare.com/webhook/market-research"
               spellCheck={false}
               autoComplete="off"
             />
@@ -578,7 +675,6 @@ export default function Home() {
               </button>
             </div>
           </div>
-
           <style jsx>{`
             .cs-root {
               position: fixed;
@@ -706,8 +802,6 @@ export default function Home() {
   );
 }
 
-/* ---------- small pieces ---------- */
-
 function Dot() {
   return (
     <span
@@ -763,7 +857,6 @@ function ColorField({
     olive: "#4d7c0f",
     bronze: "#92400e",
   };
-
   function toHex(v: string): string {
     const t = v.trim().toLowerCase();
     const noHash = t.replace("#", "");
@@ -779,10 +872,8 @@ function ColorField({
     if (NAMES[t]) return NAMES[t];
     return "#cccccc";
   }
-
   const preview = toHex(value);
   const known = preview !== "#cccccc";
-
   return (
     <div className="color-field">
       <div className="swatch-wrap">
@@ -918,91 +1009,4 @@ function HeroInstrument({
       </text>
     </svg>
   );
-}
-
-/* ---------- normalize whatever n8n returns into DocItem[] ---------- */
-function normalizeDocs(data: any): DocItem[] {
-  if (Array.isArray(data?.documents)) {
-    return data.documents
-      .map((d: any, i: number) => {
-        if (d.dataBase64) {
-          const mime =
-            d.mime ||
-            (d.kind === "pptx"
-              ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-              : "application/pdf");
-          const url = base64ToObjectUrl(d.dataBase64, mime);
-          return {
-            kind: (d.kind || "pdf") as "pdf" | "pptx",
-            title: d.title || defaultTitle(i, d),
-            subtitle: d.subtitle || "",
-            url,
-            filename: d.filename,
-          };
-        }
-        return {
-          kind: (d.kind || guessKind(d.url || d.filename)) as "pdf" | "pptx",
-          title: d.title || defaultTitle(i, d),
-          subtitle: d.subtitle || "",
-          url: d.url || d.link || d.downloadUrl,
-          filename: d.filename,
-        };
-      })
-      .filter((d: DocItem) => !!d.url);
-  }
-
-  const out: DocItem[] = [];
-  const push = (
-    url: string | undefined,
-    kind: "pdf" | "pptx",
-    title: string,
-    subtitle: string,
-  ) => {
-    if (url) out.push({ kind, title, subtitle, url });
-  };
-  push(
-    data?.reportPdfUrl,
-    "pdf",
-    "Market Research Report",
-    "The full written study",
-  );
-  push(
-    data?.actionPdfUrl,
-    "pdf",
-    "Action Plan",
-    "Company-specific recommendations",
-  );
-  push(data?.deckPptxUrl, "pptx", "Presentation Deck", "Slide-ready summary");
-  if (out.length) return out;
-
-  if (Array.isArray(data?.urls)) {
-    return data.urls.map((url: string, i: number) => ({
-      kind: guessKind(url),
-      title: defaultTitle(i, { url }),
-      subtitle: "",
-      url,
-    }));
-  }
-
-  return [];
-}
-
-function base64ToObjectUrl(b64: string, mime: string): string {
-  const clean = b64.includes(",") ? b64.split(",").pop()! : b64;
-  const bytes = atob(clean);
-  const len = bytes.length;
-  const arr = new Uint8Array(len);
-  for (let i = 0; i < len; i++) arr[i] = bytes.charCodeAt(i);
-  const blob = new Blob([arr], { type: mime });
-  return URL.createObjectURL(blob);
-}
-
-function guessKind(s?: string): "pdf" | "pptx" {
-  if (!s) return "pdf";
-  return /\.pptx?($|\?)/i.test(s) ? "pptx" : "pdf";
-}
-function defaultTitle(i: number, d: any): string {
-  const t = ["Market Research Report", "Action Plan", "Presentation Deck"];
-  if (guessKind(d.url || d.filename) === "pptx") return "Presentation Deck";
-  return t[i] || `Document ${i + 1}`;
 }
