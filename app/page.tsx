@@ -15,8 +15,16 @@ import Results, { DocItem } from "@/components/Results";
    ============================================================ */
 
 // --- Supabase public bucket base (your project) ---
+// Moved to the shared techtailoringideas project (Sept 2026); the old
+// market-research project is paused. Env-driven so the next move is a Vercel
+// setting rather than a code change.
+//
+// This bucket MUST stay public: step 3 above detects completion by GETting
+// these URLs straight from the browser. Private means the site polls forever
+// and never errors, which looks like the pipeline hanging.
 const SUPABASE_PUBLIC =
-  "https://qglyxiqaprjnrylmavkn.supabase.co/storage/v1/object/public/reports";
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLIC_BASE ||
+  "https://ypmqkwcuetvealbfmxyz.supabase.co/storage/v1/object/public/market_research";
 
 // the 3 files each job produces, in order
 const FILE_PLAN: {

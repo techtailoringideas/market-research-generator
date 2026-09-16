@@ -2,9 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
+// The n8n instance moved to mise-n8n (Sept 2026); the old n8n-production-a4a2
+// instance is being retired. The path is unchanged, only the host.
 const FALLBACK_URL =
   process.env.N8N_WEBHOOK_URL ||
-  "https://n8n-production-a4a2.up.railway.app/webhook/market-research";
+  "https://mise-n8n-production.up.railway.app/webhook/market-research";
 
 // Are we running on a server that CAN'T reach the user's localhost?
 // (Vercel/any cloud sets VERCEL or NODE_ENV=production.)
@@ -25,6 +27,14 @@ export async function POST(req: NextRequest) {
   // work (the server can't see their machine) — fall back to the real URL.
   const pointsToLocalhost = /localhost|127\.0\.0\.1/i.test(targetUrl);
   if (pointsToLocalhost && isCloud) {
+    targetUrl = FALLBACK_URL;
+  }
+
+  // Anyone who used the site before the move has the retired instance saved in
+  // localStorage, and that saved value is sent in the body — so it wins over
+  // FALLBACK_URL above. Posting there returns 404 with no sign of why, so
+  // override it. Remove this once no stale browsers are plausible.
+  if (/n8n-production-a4a2\.up\.railway\.app/i.test(targetUrl)) {
     targetUrl = FALLBACK_URL;
   }
 
